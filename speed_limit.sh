@@ -203,7 +203,7 @@ while true; do
     echo " 3. 开启 开机自启与守护进程"
     echo " 4. 关闭 开机自启与守护进程"
     echo " 5. 查看 当前配置与运行状态"
-    echo " 6. 退出脚本"
+    echo " 0. 退出脚本"
     echo "========================================="
     read -p "请选择操作 [1-6]: " num
     case "$num" in
@@ -212,8 +212,8 @@ while true; do
         3) enable_daemon ;;
         4) disable_daemon ;;
         5) show_status ;;
-        6) exit 0 ;;
-        *) echo "输入错误，请输入 1-6 之间的数字！" ;;
+        0) exit 0 ;;
+        *) echo "输入错误，请输入 0-5 之间的数字！" ;;
     esac
     echo ""
     read -n 1 -s -r -p "按任意键返回主菜单..."
