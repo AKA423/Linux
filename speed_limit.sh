@@ -205,7 +205,7 @@ while true; do
     echo " 5. 查看 当前配置与运行状态"
     echo " 0. 退出脚本"
     echo "========================================="
-    read -p "请选择操作 [1-6]: " num
+    read -p "请选择操作 [0-5]: " num
     case "$num" in
         1) setup_limit ;;
         2) clear_limit ;;
