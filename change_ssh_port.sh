@@ -1,68 +1,87 @@
 #!/bin/bash
 #
-# Debian 一键修改 SSH 端口（支持自定义）
+# 一键修改 SSH 端口 —— 同时支持 Debian / Ubuntu（含 Ubuntu 22.10+ 的 ssh.socket 套接字激活）
 # 用法：
-#   bash change_ssh_port.sh
-#   或运行后输入端口
+#   bash change_ssh_port.sh            # 交互输入端口
+#   bash change_ssh_port.sh 22122      # 直接指定端口
 #
+set -uo pipefail
 
 SSH_CONFIG="/etc/ssh/sshd_config"
-BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
+BACKUP="${SSH_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+SOCKET_OVERRIDE_DIR="/etc/systemd/system/ssh.socket.d"
+SOCKET_OVERRIDE="${SOCKET_OVERRIDE_DIR}/override.conf"
 
-# 读取端口（优先命令行参数）
-if [ -n "$1" ]; then
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+info(){ echo -e "[INFO] $*"; }
+ok(){ echo -e "${GREEN}[OK]${NC} $*"; }
+warn(){ echo -e "${YELLOW}[WARN]${NC} $*"; }
+err(){ echo -e "${RED}[ERROR]${NC} $*"; }
+
+# ---------- 前置检查 ----------
+[ "$(id -u)" -eq 0 ] || { err "请以 root 运行（sudo bash $0）"; exit 1; }
+[ -f "$SSH_CONFIG" ] || { err "找不到 $SSH_CONFIG"; exit 1; }
+
+# ---------- 读取端口 ----------
+if [ -n "${1:-}" ]; then
     NEW_PORT="$1"
 else
     read -p "请输入新的 SSH 端口: " NEW_PORT
 fi
 
-# 校验端口
 if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
-    echo "[ERROR] 端口无效：$NEW_PORT"
-    exit 1
+    err "端口无效：$NEW_PORT（应为 1-65535）"; exit 1
 fi
+[ "$NEW_PORT"-lt 1024 ] && warn "端口 <1024 为特权端口，请确认无冲突"
 
-echo "=== Debian SSH 端口修改工具 ==="
-echo "[INFO] 新端口: $NEW_PORT"
+echo "=== SSH 端口修改工具 (Debian / Ubuntu) ==="
+info "新端口: $NEW_PORT"
 
-# 1. 备份配置
-cp $SSH_CONFIG $BACKUP
-echo "[OK] 已备份配置到: $BACKUP"
+# ---------- 识别发行版 ----------
+DISTRO="unknown"; VER=""
+if [ -r /etc/os-release ]; then
+    . /etc/os-release
+    DISTRO="${ID:-unknown}"; VER="${VERSION_ID:-}"
+fi
+info "发行版: ${DISTRO} ${VER}"
 
-# 2. 修改 sshd_config
-if grep -q "^#Port " $SSH_CONFIG || grep -q "^Port " $SSH_CONFIG; then
-    sed -i "s/^#Port .*/Port $NEW_PORT/" $SSH_CONFIG
-    sed -i "s/^Port .*/Port $NEW_PORT/" $SSH_CONFIG
+# ---------- 1. 备份 ----------
+cp -a "$SSH_CONFIG" "$BACKUP" && ok "已备份: $BACKUP"
+
+# ---------- 2. 修改 sshd_config ----------
+if grep -qiE '^[#[:space:]]*Port[[:space:]]' "$SSH_CONFIG"; then
+    sed -i -E "s/^[#[:space:]]*Port[[:space:]].*/Port $NEW_PORT/" "$SSH_CONFIG"
 else
-    echo "Port $NEW_PORT" >> $SSH_CONFIG
+    echo "Port $NEW_PORT" >> "$SSH_CONFIG"
 fi
-echo "[OK] SSH 配置文件已更新"
+ok "sshd_config 已设置 Port $NEW_PORT"
 
-# 3. 放行防火墙
-if command -v ufw >/dev/null 2>&1; then
-    echo "[INFO] 检测到 UFW，放行端口..."
-    ufw allow ${NEW_PORT}/tcp
+# 子配置（ssh 9.1+ 的 Include）里若有 Port 会覆盖主配置，给出提醒
+if grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$SSH_CONFIG"; thenif grep -rqiE '^[[:space:]]*Port[[:space:]]' /etc/ssh/sshd_config.d/ 2>/dev/null; then
+        warn "sshd_config.d/ 子配置里也有 Port，会覆盖主配置，请自行确认"
+    fi
+fi
+
+# ---------- 3. 语法检查（失败自动回滚） ----------
+if command -v sshd >/dev/null 2>&1; then
+    if sshd -t >/dev/null 2>/tmp/sshd_t.err; then
+        ok "配置语法检查通过"
+    else
+        err "配置语法错误，已回滚"
+        cat /tmp/sshd_t.err
+        cp -a "$BACKUP" "$SSH_CONFIG"
+        exit 1
+    fi
+fi
+
+# ---------- 4. 防火墙放行 ----------
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+    info "检测到 UFW（已启用），放行 $NEW_PORT/tcp"
+    ufw allow "${NEW_PORT}/tcp" && ok "UFW 规则已更新"
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    info "检测到 firewalld（已启用），放行 $NEW_PORT/tcp"
+    firewall-cmd--permanent --add-port="${NEW_PORT}/tcp" && firewall-cmd --reload && ok "firewalld 规则已更新"
 elif command -v iptables >/dev/null 2>&1; then
-    echo "[INFO] 使用 iptables 放行端口..."
-    iptables -A INPUT -p tcp --dport ${NEW_PORT} -j ACCEPT
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null
-fi
-echo "[OK] 防火墙规则已更新"
-
-# 4. 重启 SSH 服务
-echo "[INFO] 正在重启 SSH 服务..."
-systemctl restart ssh 2>/dev/null || systemctl restart sshd
-
-# 5. 检查端口是否监听
-sleep 1
-if ss -tlnp | grep -q ":$NEW_PORT"; then
-    echo "[SUCCESS] SSH 已成功监听端口 $NEW_PORT"
-    echo "请测试新端口："
-    echo "ssh root@服务器IP -p $NEW_PORT"
-else
-    echo "[ERROR] SSH 未成功监听新端口，已保留当前会话。"
-    echo "你可以恢复备份："
-    echo "cp $BACKUP $SSH_CONFIG && systemctl restart ssh"
-fi
-
-echo "=== 完成 ==="
+    info "使用 iptables 放行 $NEW_PORT/tcp"
+    iptables -C INPUT -p tcp --dport "$NEW_PORT" -j ACCEPT 2>/dev/null \
+        || iptables -A INPUT -p tcp --dport "$NEW_PORT" -j ACCEPT
