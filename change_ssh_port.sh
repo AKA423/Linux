@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 #
-# ssh-set-port.sh —— 修改 SSH 端口 + 自动放行防火墙（非交互）
+# ssh-port-prompt.sh —— 运行后弹出界面，输入端口即自动修改 SSH 端口
 #   目标平台: Debian 13 (trixie) / Ubuntu 26.04（兼容相近版本）
 #
 # 用法:
-#   sudo ./ssh-set-port.sh 2222              # 改成 2222，自动放行防火墙
-#   sudo ./ssh-set-port.sh 2222 --keep-old   # 保留旧端口，新旧并存
-#   sudo ./ssh-set-port.sh 2222 --no-firewall
-#   sudo ./ssh-set-port.sh 2222 --dry-run    # 只预览
+#   sudo ./ssh-port-prompt.sh                # 弹出输入框，让你填端口
+#   sudo ./ssh-port-prompt.sh --keep-old     # 保留旧端口（新旧并存）
+#   sudo ./ssh-port-prompt.sh --no-firewall  # 不动防火墙
+#   sudo ./ssh-port-prompt.sh 2222           # 也可以直接带上端口，跳过输入
 #
-# 退出码: 0=成功  1=执行失败  2=参数错误
+# 只需输入端口，其余全自动：查占用 → 放行防火墙 → 备份 → 写配置
+#                          → sshd -t 校验 → 重启 → 验证 → 打印结果
 #
 set -uo pipefail
 
@@ -22,12 +23,14 @@ SOCKET_DROPIN="$SOCKET_DROPIN_DIR/10-ssh-port.conf"
 BACKUP_ROOT="/etc/ssh/.ssh-port-backup"
 SSH_SERVICE="ssh.service"
 SSH_SOCKET="ssh.socket"
+DEFAULT_PORT="2222"
 
-# ======================== 输出 ========================
+# ======================== 配色 ========================
 if [ -t 1 ]; then
-  RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYN=$'\033[36m'; R=$'\033[0m'
+  B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'
+  RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYN=$'\033[36m'; MAG=$'\033[35m'
 else
-  RED=""; GRN=""; YEL=""; CYN=""; R=""
+  B=""; D=""; R=""; RED=""; GRN=""; YEL=""; CYN=""; MAG=""
 fi
 ok()   { printf '%s  ✓ %s%s\n' "$GRN" "$*" "$R"; }
 warn() { printf '%s  ! %s%s\n' "$YEL" "$*" "$R"; }
@@ -35,43 +38,34 @@ err()  { printf '%s  ✗ %s%s\n' "$RED" "$*" "$R" >&2; }
 info() { printf '    %s\n' "$*"; }
 step() { printf '\n%s==> %s%s\n' "$CYN" "$*" "$R"; }
 
-usage() {
-  cat <<'EOF'
-用法: sudo ssh-set-port.sh <端口> [选项]
-
-选项:
-  --keep-old       保留旧端口，仅追加新端口（更安全）
-  --no-firewall    跳过防火墙放行
-  --dry-run        只预览将要执行的操作，不做改动
-  -h, --help       显示帮助
-
-示例:
-  sudo ssh-set-port.sh 2222
-  sudo ssh-set-port.sh 2222 --keep-old
-  curl -fsSL <URL> | sudo bash -s -- 2222
-EOF
+# ======================== 输入（支持管道运行） ========================
+# 优先用终端读入；若 stdin 是管道（curl | bash），改从 /dev/tty 读，避免吃掉脚本
+read_input() { # read_input <变量名> ; 提示由调用方先打印
+  local __v="$1" __x
+  if [ -t 0 ]; then
+    read -r __x || return 1
+  elif [ -r /dev/tty ] && [ -t 1 ]; then
+    read -r __x < /dev/tty || return 1
+  else
+    return 1
+  fi
+  printf -v "$__v" '%s' "$__x"
 }
 
 # ======================== 参数 ========================
-NEW_PORT=""; KEEP_OLD=0; DO_FW=1; DRY=0
+KEEP_OLD=0; DO_FW=1; ARG_PORT=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    -h|--help)   usage; exit 0 ;;
-    --keep-old)  KEEP_OLD=1; shift ;;
+    --keep-old)    KEEP_OLD=1; shift ;;
     --no-firewall) DO_FW=0; shift ;;
-    --dry-run)   DRY=1; shift ;;
-    -*)          err "未知选项: $1"; usage; exit 2 ;;
-    *)           NEW_PORT="$1"; shift ;;
+    -h|--help)     sed -n '2,/^set /p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)            err "未知选项: $1"; exit 2 ;;
+    *)             ARG_PORT="$1"; shift ;;
   esac
 done
 
-[ -n "$NEW_PORT" ] || { err "缺少端口参数"; usage; exit 2; }
-if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
-  err "端口无效: $NEW_PORT （需 1-65535）"; exit 2
-fi
-
 # ======================== 前置检查 ========================
-[ "$(id -u)" -eq 0 ] || { err "需要 root: sudo $0 $NEW_PORT"; exit 1; }
+[ "$(id -u)" -eq 0 ] || { err "需要 root 权限，请用: sudo $0"; exit 1; }
 if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
   err "未找到 sshd，请先安装 openssh-server"; exit 1
 fi
@@ -110,8 +104,8 @@ nft_input_chain() {
   '
 }
 
-count_ports() { "$SSHD_BIN" -T 2>/dev/null | awk '/^port /{printf "%s ",$2}'; }
-who_on_port() { ss -tlnH "sport = :$1" 2>/dev/null | awk '{print $NF" "$4}' | tr '\n' ' '; }
+count_ports()  { "$SSHD_BIN" -T 2>/dev/null | awk '/^port /{printf "%s ",$2}'; }
+who_on_port()  { ss -tlnH "sport = :$1" 2>/dev/null | awk '{print $NF" "$4}' | tr '\n' ' '; }
 
 # ======================== 备份 / 回滚 ========================
 do_backup() {
@@ -154,28 +148,21 @@ open_firewall() {
   step "放行防火墙 ${NEW_PORT}/tcp (后端: $FW_BACKEND)"
   case "$FW_BACKEND" in
     ufw)
-      ufw allow "${NEW_PORT}/tcp" >/dev/null 2>&1 && ok "ufw: 已放行" || { err "ufw 放行失败"; return 1; }
-      ;;
+      ufw allow "${NEW_PORT}/tcp" >/dev/null 2>&1 && ok "ufw: 已放行" || { err "ufw 放行失败"; return 1; } ;;
     firewalld)
       firewall-cmd --permanent --add-port="${NEW_PORT}/tcp" >/dev/null 2>&1
       firewall-cmd --reload >/dev/null 2>&1
-      ok "firewalld: 已放行"
-      ;;
+      ok "firewalld: 已放行" ;;
     nftables)
       local c; c="$(nft_input_chain)"
       # shellcheck disable=SC2086
       nft add rule $c tcp dport "$NEW_PORT" accept && ok "nftables: 已放行 [$c]"
       if [ -f /etc/nftables.conf ] && systemctl is-enabled --quiet nftables 2>/dev/null; then
-        if [ "$DRY" -eq 0 ]; then
-          cp -a /etc/nftables.conf "/etc/nftables.conf.bak.$(date +%Y%m%d-%H%M%S)"
-          nft list ruleset > /etc/nftables.conf && ok "nftables: 已写入 /etc/nftables.conf（原文件已备份）"
-        else
-          info "[dry-run] 将写入 /etc/nftables.conf"
-        fi
+        cp -a /etc/nftables.conf "/etc/nftables.conf.bak.$(date +%Y%m%d-%H%M%S)"
+        nft list ruleset > /etc/nftables.conf && ok "nftables: 已写入 /etc/nftables.conf（原文件已备份）"
       else
         warn "nftables 规则仅当前生效（重启后可能丢失），请自行写入 /etc/nftables.conf"
-      fi
-      ;;
+      fi ;;
     iptables)
       if iptables -C INPUT -p tcp --dport "$NEW_PORT" -j ACCEPT 2>/dev/null; then
         info "iptables: 规则已存在"
@@ -188,11 +175,9 @@ open_firewall() {
         iptables-save > /etc/iptables/rules.v4 && ok "iptables: 已保存 rules.v4"
       else
         warn "iptables 规则重启后可能丢失"
-      fi
-      ;;
+      fi ;;
     *)
-      info "未检测到启用的防火墙，无需放行"
-      ;;
+      info "未检测到启用的防火墙，无需放行" ;;
   esac
   return 0
 }
@@ -202,7 +187,7 @@ comment_port_lines() {
   local f="$1"
   [ -f "$f" ] || return 0
   grep -qE '^[[:space:]]*Port[[:space:]]+' "$f" || return 0
-  sed -i -E 's@^([[:space:]]*Port[[:space:]]+.*)$@#&  # disabled by ssh-set-port.sh@' "$f"
+  sed -i -E 's@^([[:space:]]*Port[[:space:]]+.*)$@#&  # disabled by ssh-port-prompt.sh@' "$f"
   info "已注释旧端口行: $f"
 }
 
@@ -226,30 +211,23 @@ apply_config() {
     fi
   fi
 
-  if [ "$DRY" -eq 1 ]; then
-    info "[dry-run] 写入 Port $targets"
-    [ "$SSH_MODE" = socket ] && info "[dry-run] 写入 ssh.socket ListenStream=$targets"
-    return 0
-  fi
-
-  # sshd_config 侧
   if [ -d "$SSHD_DROPIN_DIR" ] && grep -qE '^[[:space:]]*Include[[:space:]].*sshd_config\.d' "$SSHD_MAIN"; then
-    { printf '# managed by ssh-set-port.sh (%s)\n' "$(date -Is)"
+    { printf '# managed by ssh-port-prompt.sh (%s)\n' "$(date -Is)"
       for p in $targets; do printf 'Port %s\n' "$p"; done
     } > "$SSHD_DROPIN"
     chmod 600 "$SSHD_DROPIN"
     ok "已写入: $SSHD_DROPIN"
   else
-    { printf '\n# managed by ssh-set-port.sh (%s)\n' "$(date -Is)"
+    { printf '\n# managed by ssh-port-prompt.sh (%s)\n' "$(date -Is)"
       for p in $targets; do printf 'Port %s\n' "$p"; done
     } >> "$SSHD_MAIN"
     ok "已追加: $SSHD_MAIN"
   fi
 
-  # socket 侧（Debian 13 / Ubuntu 26.04 关键）
+  # socket 侧 —— Debian 13 / Ubuntu 26.04 关键
   if [ "$SSH_MODE" = socket ]; then
     mkdir -p "$SOCKET_DROPIN_DIR"
-    { printf '# managed by ssh-set-port.sh (%s)\n[Socket]\nListenStream=\n' "$(date -Is)"
+    { printf '# managed by ssh-port-prompt.sh (%s)\n[Socket]\nListenStream=\n' "$(date -Is)"
       for p in $targets; do printf 'ListenStream=%s\n' "$p"; done
     } > "$SOCKET_DROPIN"
     ok "已写入: $SOCKET_DROPIN（socket 激活）"
@@ -257,13 +235,11 @@ apply_config() {
 }
 
 validate_config() {
-  [ "$DRY" -eq 1 ] && return 0
   if "$SSHD_BIN" -t 2>/tmp/sshd_t.err; then ok "配置校验通过"; return 0; fi
   err "配置校验失败:"; cat /tmp/sshd_t.err >&2; return 1
 }
 
 restart_ssh() {
-  [ "$DRY" -eq 1 ] && return 0
   detect_ssh_mode
   if [ "$SSH_MODE" = socket ]; then
     systemctl daemon-reload
@@ -279,42 +255,86 @@ restart_ssh() {
 }
 
 verify() {
-  [ "$DRY" -eq 1 ] && return 0
   local i who
   for i in 1 2 3 4 5; do who="$(who_on_port "$NEW_PORT")"; [ -n "$who" ] && break; sleep 1; done
   [ -n "$who" ] && { ok "已在 $NEW_PORT 监听: $who"; return 0; }
   err "未在 $NEW_PORT 检测到监听"; return 1
 }
 
+# ======================== 弹窗输入 ========================
+draw_box() {
+  # draw_box <标题> <行1> <行2> ...
+  local title="$1"; shift
+  local w=56 line=""
+  printf '%s╔═%s═╗%s\n' "$MAG$B" "$(printf '═%.0s' $(seq 1 $((w-6))))" "$R"
+  printf '%s║%s %-*s %s║%s\n' "$MAG$B" "$R" $((w-4)) "$title" "$MAG$B" "$R"
+  printf '%s╠═%s═╣%s\n' "$MAG$B" "$(printf '═%.0s' $(seq 1 $((w-6))))" "$R"
+  local l
+  for l in "$@"; do
+    printf '%s║%s %-*s %s║%s\n' "$MAG$B" "$R" $((w-4)) "$l" "$MAG$B" "$R"
+  done
+  printf '%s╚═%s═╝%s\n' "$MAG$B" "$(printf '═%.0s' $(seq 1 $((w-6))))" "$R"
+}
+
+ask_port_box() {
+  detect_ssh_mode; detect_firewall
+  clear 2>/dev/null || true
+  draw_box "修改 SSH 端口" \
+    "系统     : ${OS_NAME:-unknown}" \
+    "SSH 模式 : $([ "$SSH_MODE" = socket ] && echo 'socket 激活' || echo '常规 service')" \
+    "当前端口 : $(count_ports)" \
+    "防火墙   : $FW_BACKEND"
+  echo
+
+  local p
+  while true; do
+    printf '  %s请输入新的 SSH 端口%s (1-65535) [回车默认 %s，q 退出]: ' "$B" "$R" "$DEFAULT_PORT"
+    if ! read_input p; then
+      err "无法读取输入（没有可用终端）"; exit 1
+    fi
+    p="${p:-$DEFAULT_PORT}"
+    case "$p" in q|Q) echo "已取消"; exit 0 ;; esac
+    if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
+      NEW_PORT="$p"; return 0
+    fi
+    warn "端口无效：$p（必须是 1-65535 的整数）"
+  done
+}
+
 # ======================== 主流程 ========================
 main() {
-  detect_ssh_mode
-  detect_firewall
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_NAME="${PRETTY_NAME:-unknown}"
+  else
+    OS_NAME="unknown"
+  fi
 
-  step "开始：SSH 端口 -> $NEW_PORT"
+  NEW_PORT="$ARG_PORT"
+  if [ -n "$NEW_PORT" ]; then
+    if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
+      err "端口无效: $NEW_PORT （需 1-65535）"; exit 2
+    fi
+  else
+    ask_port_box
+    echo
+  fi
+
+  step "目标：SSH 端口 -> $NEW_PORT"
   info "当前端口 : $(count_ports)"
-  info "SSH 模式 : $([ "$SSH_MODE" = socket ] && echo 'socket 激活（会同时改 ssh.socket）' || echo '常规 service')"
-  info "防火墙   : $FW_BACKEND"
   info "旧端口   : $([ "$KEEP_OLD" -eq 1 ] && echo '保留' || echo '替换')"
+  info "防火墙   : $([ "$DO_FW" -eq 1 ] && echo "自动放行 ($FW_BACKEND)" || echo '跳过')"
 
-  # 已是当前端口
   if printf ' %s ' "$(count_ports)" | grep -q " ${NEW_PORT} "; then
     warn "端口 $NEW_PORT 已是 SSH 当前端口，无需修改"; exit 0
   fi
-  # 冲突检查
   local who; who="$(who_on_port "$NEW_PORT")"
   if [ -n "$who" ]; then err "端口 $NEW_PORT 已被占用: $who"; exit 1; fi
   ok "端口 $NEW_PORT 可用"
 
-  if [ "$DRY" -eq 1 ]; then
-    step "预演模式（不做任何改动）"
-    info "将执行: 备份 → $([ "$DO_FW" -eq 1 ] && echo "放行 $NEW_PORT/tcp" || echo '跳过防火墙') → 写配置 → sshd -t → 重启 → 验证"
-    exit 0
-  fi
-
   do_backup
   [ "$DO_FW" -eq 1 ] && { open_firewall || { rollback; exit 1; }; }
-
   apply_config    || { err "写配置失败"; rollback; exit 1; }
   validate_config || { rollback; exit 1; }
   restart_ssh     || { rollback; exit 1; }
@@ -324,7 +344,9 @@ main() {
   printf '  %-10s %s\n' "新端口"   "$NEW_PORT"
   printf '  %-10s %s\n' "生效端口" "$(count_ports)"
   printf '  %-10s %s\n' "备份目录" "$BACKUP_DIR"
-  warn "先别断开当前会话，新开终端测试: ssh -p $NEW_PORT <用户>@<主机>"
+  echo
+  warn "先别断开当前会话！新开终端测试:"
+  printf '    %sssh -p %s <用户>@<主机>%s\n' "$B" "$NEW_PORT" "$R"
 }
 
-main
+main "$@"
